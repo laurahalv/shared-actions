@@ -1,0 +1,80 @@
+name: Shared Gemini PR Description
+
+on:
+  workflow_call:
+    secrets:
+      GEMINI_API_KEY:
+        required: true
+
+jobs:
+  generate-description:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract PR Diff
+        id: get_diff
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD > pr_diff.txt
+          head -c 20000 pr_diff.txt > pr_diff_trimmed.txt
+
+      - name: Generate Summary with Gemini API
+        id: gemini
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          DIFF_CONTENT=$(jq -sR . pr_diff_trimmed.txt)
+          
+          PROMPT="Você é um especialista em code review. Analise a diferença de código (git diff) abaixo e gere um resumo conciso em Markdown para ser colocado na descrição deste Pull Request. Fale diretamente, sem \"aqui está sua descrição\". Inclua: 1. Breve resumo do objetivo da alteração, 2. Lista de principais mudanças feitas, 3. Impacto no projeto.\n\nDiff do código:\n$DIFF_CONTENT"
+          
+          JSON_PAYLOAD=$(jq -n --arg prompt "$PROMPT" '{
+            contents: [{
+              parts: [{ text: $prompt }]
+            }]
+          }')
+
+          MODELS=("gemini-2.5-flash" "gemini-1.5-flash")
+          SUMMARY=""
+
+          for MODEL in "${MODELS[@]}"; do
+            RESPONSE=$(curl -s -X POST "https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${GEMINI_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "$JSON_PAYLOAD")
+
+            SUMMARY=$(echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // empty')
+
+            if [ -n "$SUMMARY" ]; then
+              break
+            fi
+
+            echo "⚠️ Falha/Instabilidade em $MODEL. Tentando próximo modelo..."
+            sleep 15
+          done
+
+          if [ -z "$SUMMARY" ]; then
+            SUMMARY="⚠️ Não foi possível gerar a descrição automática devido a uma instabilidade na API do Gemini."
+          fi
+          
+          echo "summary<<EOF" >> $GITHUB_OUTPUT
+          echo "$SUMMARY" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Update PR Description
+        uses: actions/github-script@v7
+        env:
+          PR_SUMMARY: ${{ steps.gemini.outputs.summary }}
+        with:
+          script: |
+            const { PR_SUMMARY } = process.env;
+            
+            const newBody = `### 🤖 Descrição Gerada por IA (Gemini)\n\n${PR_SUMMARY}\n\n---\n*Gerado automaticamente via Gemini API.*`;
+            
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              body: newBody
+            });
